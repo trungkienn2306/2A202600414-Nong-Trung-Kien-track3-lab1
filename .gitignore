@@ -8,4 +8,10 @@ env/
 .env
 .pytest_cache/
 outputs/
+!outputs/
+outputs/*
+!outputs/final_real100/
+outputs/final_real100/*
+!outputs/final_real100/report.json
+!outputs/final_real100/report.md
 .DS_Store

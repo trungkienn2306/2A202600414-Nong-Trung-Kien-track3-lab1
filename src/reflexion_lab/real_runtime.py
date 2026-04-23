@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from functools import lru_cache
 from typing import Any
 
 from dotenv import load_dotenv
@@ -29,6 +30,7 @@ def _first_env(*names: str, required_label: str) -> str:
     raise RuntimeError(f"Missing required environment variable: {required_label}")
 
 
+@lru_cache(maxsize=1)
 def _client() -> OpenAI:
     base_url = _get_env("DEFAULT_BASE_URL")
     api_key = _first_env("default_api_key", "DEFAULT_API_KEY", required_label="default_api_key/DEFAULT_API_KEY")
@@ -67,8 +69,49 @@ def _context_block(example: QAExample) -> str:
     return "\n\n".join(blocks)
 
 
+def _with_retries(
+    fn,
+    *,
+    max_retries: int,
+    retry_backoff_seconds: float,
+    logger: Any | None = None,
+    log_payload: dict[str, Any] | None = None,
+):
+    last_error: Exception | None = None
+    attempts = max_retries + 1
+    for retry_count in range(attempts):
+        try:
+            started = time.perf_counter()
+            result = fn()
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            return result, retry_count, latency_ms
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if logger is not None:
+                logger.emit(
+                    "llm_call_retry",
+                    level="info",
+                    retry_count=retry_count,
+                    max_retries=max_retries,
+                    error=str(exc),
+                    **(log_payload or {}),
+                )
+            if retry_count >= max_retries:
+                break
+            sleep_s = retry_backoff_seconds * (2**retry_count)
+            time.sleep(sleep_s)
+    raise RuntimeError(f"LLM call failed after retries: {last_error}") from last_error
+
+
 def actor_answer(
-    example: QAExample, attempt_id: int, agent_type: str, reflection_memory: list[str]
+    example: QAExample,
+    attempt_id: int,
+    agent_type: str,
+    reflection_memory: list[str],
+    *,
+    logger: Any | None = None,
+    max_retries: int = 2,
+    retry_backoff_seconds: float = 1.0,
 ) -> tuple[str, int, int]:
     model = _first_env("default_model", "DEFAULT_MODEL", required_label="default_model/DEFAULT_MODEL")
     memory_text = "\n".join(f"- {item}" for item in reflection_memory[-5:]) if reflection_memory else "(none)"
@@ -82,21 +125,47 @@ def actor_answer(
     )
 
     client = _client()
-    started = time.perf_counter()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": ACTOR_SYSTEM},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
+    response, retry_count, latency_ms = _with_retries(
+        lambda: client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": ACTOR_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            timeout=60,
+        ),
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        logger=logger,
+        log_payload={"call_type": "actor", "agent_type": agent_type, "qid": example.qid, "attempt_id": attempt_id, "model": model},
     )
-    latency_ms = int((time.perf_counter() - started) * 1000)
     answer = _extract_text(response)
-    return answer, _usage_tokens(response), latency_ms
+    tokens = _usage_tokens(response)
+    if logger is not None:
+        logger.llm_call_end(
+            call_type="actor",
+            agent_type=agent_type,
+            qid=example.qid,
+            attempt_id=attempt_id,
+            model=model,
+            latency_ms=latency_ms,
+            tokens=tokens,
+            retry_count=retry_count,
+        )
+    return answer, tokens, latency_ms
 
 
-def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, int, int]:
+def evaluator(
+    example: QAExample,
+    answer: str,
+    *,
+    logger: Any | None = None,
+    agent_type: str = "unknown",
+    attempt_id: int = 0,
+    max_retries: int = 2,
+    retry_backoff_seconds: float = 1.0,
+) -> tuple[JudgeResult, int, int]:
     judge_model = _first_env("judge_model", "JUDGE_MODEL", required_label="judge_model/JUDGE_MODEL")
     user_prompt = (
         f"question: {example.question}\n"
@@ -105,17 +174,22 @@ def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, int, int]:
         "Judge correctness and return strict JSON."
     )
     client = _client()
-    started = time.perf_counter()
-    response = client.chat.completions.create(
-        model=judge_model,
-        messages=[
-            {"role": "system", "content": EVALUATOR_SYSTEM},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0,
+    response, retry_count, latency_ms = _with_retries(
+        lambda: client.chat.completions.create(
+            model=judge_model,
+            messages=[
+                {"role": "system", "content": EVALUATOR_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            timeout=60,
+        ),
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        logger=logger,
+        log_payload={"call_type": "evaluator", "agent_type": agent_type, "qid": example.qid, "attempt_id": attempt_id, "model": judge_model},
     )
-    latency_ms = int((time.perf_counter() - started) * 1000)
     raw = _extract_text(response)
     try:
         data = json.loads(raw)
@@ -127,11 +201,31 @@ def evaluator(example: QAExample, answer: str) -> tuple[JudgeResult, int, int]:
             "spurious_claims": [answer] if answer else [],
         }
     result = JudgeResult.model_validate(data)
-    return result, _usage_tokens(response), latency_ms
+    tokens = _usage_tokens(response)
+    if logger is not None:
+        logger.llm_call_end(
+            call_type="evaluator",
+            agent_type=agent_type,
+            qid=example.qid,
+            attempt_id=attempt_id,
+            model=judge_model,
+            latency_ms=latency_ms,
+            tokens=tokens,
+            retry_count=retry_count,
+        )
+    return result, tokens, latency_ms
 
 
 def reflector(
-    example: QAExample, attempt_id: int, judge: JudgeResult, answer: str
+    example: QAExample,
+    attempt_id: int,
+    judge: JudgeResult,
+    answer: str,
+    *,
+    logger: Any | None = None,
+    agent_type: str = "reflexion",
+    max_retries: int = 2,
+    retry_backoff_seconds: float = 1.0,
 ) -> tuple[ReflectionEntry, int, int]:
     model = _first_env("default_model", "DEFAULT_MODEL", required_label="default_model/DEFAULT_MODEL")
     user_prompt = (
@@ -143,17 +237,22 @@ def reflector(
         "Return strict JSON reflection."
     )
     client = _client()
-    started = time.perf_counter()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": REFLECTOR_SYSTEM},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
+    response, retry_count, latency_ms = _with_retries(
+        lambda: client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": REFLECTOR_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            timeout=60,
+        ),
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+        logger=logger,
+        log_payload={"call_type": "reflector", "agent_type": agent_type, "qid": example.qid, "attempt_id": attempt_id, "model": model},
     )
-    latency_ms = int((time.perf_counter() - started) * 1000)
     raw = _extract_text(response)
     try:
         data = json.loads(raw)
@@ -165,4 +264,16 @@ def reflector(
             "next_strategy": "Resolve each hop explicitly and verify final entity against context.",
         }
     reflection = ReflectionEntry.model_validate(data)
-    return reflection, _usage_tokens(response), latency_ms
+    tokens = _usage_tokens(response)
+    if logger is not None:
+        logger.llm_call_end(
+            call_type="reflector",
+            agent_type=agent_type,
+            qid=example.qid,
+            attempt_id=attempt_id,
+            model=model,
+            latency_ms=latency_ms,
+            tokens=tokens,
+            retry_count=retry_count,
+        )
+    return reflection, tokens, latency_ms
